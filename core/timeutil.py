@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import logging
+import re
 import socket
 import struct
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional
-import re
 
 try:
     from zoneinfo import ZoneInfo
@@ -17,30 +17,29 @@ except Exception:
 logger = logging.getLogger(__name__)
 
 _ISO_Z_RE = re.compile(r"Z$", re.IGNORECASE)
-_REL_RE = re.compile(r"^\s*in\s+(\d+)\s*(minute|minutes|hour|hours|day|days)\s*$", re.IGNORECASE)
+_REL_RE   = re.compile(
+    r"^\s*in\s+(\d+)\s*(minute|minutes|hour|hours|day|days)\s*$",
+    re.IGNORECASE,
+)
 
-SL_OFFSET = timezone(timedelta(hours=5, minutes=30), name="UTC+05:30")
-LOCAL_TZ_NAME = "Asia/Colombo"
+SL_OFFSET      = timezone(timedelta(hours=5, minutes=30), name="UTC+05:30")
+LOCAL_TZ_NAME  = "Asia/Colombo"
 
-# NTP configuration
-NTP_SERVERS = [
-    "pool.ntp.org",
-    "time.google.com",
-    "time.cloudflare.com",
-    "time.windows.com",
-]
-NTP_PORT = 123
-NTP_TIMEOUT = 3.0          # seconds per server
-MAX_CLOCK_DRIFT_SECONDS = 30  # reject if local clock drifts more than this
-NTP_QUERY_INTERVAL = 300   # re-query NTP at most every 5 minutes
+# ── NTP configuration ─────────────────────────────────────────────
+NTP_SERVERS           = ["pool.ntp.org", "time.google.com",
+                         "time.cloudflare.com", "time.windows.com"]
+NTP_PORT              = 123
+NTP_TIMEOUT           = 3.0   # seconds per server
+MAX_CLOCK_DRIFT_SECS  = 30    # reject if local clock drifts more than this
+NTP_QUERY_INTERVAL    = 300   # re-query every 5 minutes at most
+_NTP_DELTA            = 2208988800  # NTP epoch (1900) → Unix epoch (1970)
 
-# NTP epoch offset: difference between NTP epoch (1900) and Unix epoch (1970)
-_NTP_DELTA = 2208988800
+# Module-level NTP cache
+_last_ntp_check:  float          = 0.0
+_last_ntp_offset: Optional[float] = None
 
-# Module-level cache
-_last_ntp_check: float = 0.0          # local monotonic time of last check
-_last_ntp_offset: Optional[float] = None  # seconds: ntp_time - local_time
 
+# ── Timezone helper ───────────────────────────────────────────────
 
 def _get_local_tz():
     if ZoneInfo is not None:
@@ -51,145 +50,110 @@ def _get_local_tz():
     return SL_OFFSET
 
 
-def _query_single_ntp(server: str) -> Optional[float]:
-    """
-    Query one NTP server. Returns UTC Unix timestamp or None on failure.
-    Uses RFC 5905 NTP v4 client packet (48 bytes).
-    """
-    try:
-        # Build NTP request packet
-        packet = bytearray(48)
-        packet[0] = 0x23  # LI=0, VN=4, Mode=3 (client)
+# ── NTP internals ─────────────────────────────────────────────────
 
+def _query_single_ntp(server: str) -> Optional[float]:
+    """Query one NTP server. Returns UTC Unix timestamp or None."""
+    try:
+        packet = bytearray(48)
+        packet[0] = 0x23          # LI=0, VN=4, Mode=3 (client)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(NTP_TIMEOUT)
-
         send_time = time.time()
         sock.sendto(bytes(packet), (server, NTP_PORT))
         data, _ = sock.recvfrom(1024)
         recv_time = time.time()
         sock.close()
-
         if len(data) < 48:
             return None
-
-        # Transmit timestamp is at bytes 40-47
         tx_secs = struct.unpack("!I", data[40:44])[0]
         tx_frac = struct.unpack("!I", data[44:48])[0]
-
-        ntp_timestamp = tx_secs - _NTP_DELTA + tx_frac / 2**32
-
-        # Use midpoint of round-trip as our estimate
-        rtt = recv_time - send_time
-        estimated_server_time = ntp_timestamp + rtt / 2
-
-        return estimated_server_time
-
-    except Exception as e:
-        logger.debug("NTP query failed for %s: %s", server, e)
+        ntp_ts  = tx_secs - _NTP_DELTA + tx_frac / 2 ** 32
+        return ntp_ts + (recv_time - send_time) / 2   # midpoint correction
+    except Exception as exc:
+        logger.debug("NTP query failed for %s: %s", server, exc)
         return None
 
 
 def _fetch_ntp_time() -> Optional[float]:
-    """
-    Query multiple NTP servers, return median of successful responses.
-    Returns UTC Unix timestamp or None if all servers fail.
-    """
+    """Query multiple NTP servers; return median of successes."""
     results: List[float] = []
-    for server in NTP_SERVERS:
-        ts = _query_single_ntp(server)
+    for srv in NTP_SERVERS:
+        ts = _query_single_ntp(srv)
         if ts is not None:
             results.append(ts)
         if len(results) >= 2:
-            break  # enough for a basic sanity check
-
+            break
     if not results:
         return None
-
     results.sort()
-    # Median
     mid = len(results) // 2
-    return results[mid] if len(results) % 2 == 1 else (results[mid - 1] + results[mid]) / 2
+    return results[mid] if len(results) % 2 == 1 else (results[mid-1] + results[mid]) / 2
 
 
 def _update_ntp_offset(force: bool = False) -> None:
-    """
-    Update the cached NTP offset if enough time has passed or forced.
-    Raises RuntimeError if clock drift is unacceptable.
-    """
+    """Refresh cached NTP offset; raise RuntimeError on clock manipulation."""
     global _last_ntp_check, _last_ntp_offset
-
     now_mono = time.monotonic()
     if not force and (now_mono - _last_ntp_check) < NTP_QUERY_INTERVAL:
-        return  # Use cached offset
+        return
 
-    ntp_ts = _fetch_ntp_time()
+    ntp_ts   = _fetch_ntp_time()
     local_ts = time.time()
 
     if ntp_ts is None:
-        # Cannot reach any NTP server — warn but don't block if we have a cached offset
         if _last_ntp_offset is None:
-            logger.warning(
-                "Cannot reach NTP servers and no cached offset. "
-                "Time integrity cannot be guaranteed."
-            )
+            logger.warning("Cannot reach NTP servers. Time integrity cannot be guaranteed.")
         else:
-            logger.warning("NTP unreachable; using cached offset (%.1fs)", _last_ntp_offset)
+            logger.warning("NTP unreachable; using cached offset (%.1fs).", _last_ntp_offset)
         _last_ntp_check = now_mono
         return
 
     offset = ntp_ts - local_ts
     _last_ntp_check = now_mono
 
+    # Detect sudden jump since last check (rollback / forward attack)
     if _last_ntp_offset is not None:
-        # Check if offset changed dramatically since last check (rolling-back attack)
         delta = abs(offset - _last_ntp_offset)
-        if delta > MAX_CLOCK_DRIFT_SECONDS:
+        if delta > MAX_CLOCK_DRIFT_SECS:
             raise RuntimeError(
-                f"SECURITY ALERT: System clock appears to have been manipulated. "
-                f"NTP offset changed by {delta:.1f}s since last check. "
-                f"Previous offset={_last_ntp_offset:.1f}s, current={offset:.1f}s. "
-                f"Refusing to operate."
+                f"[SECURITY ALERT] System clock changed by {delta:.1f}s since last check.\n"
+                f"  Previous NTP offset : {_last_ntp_offset:+.1f}s\n"
+                f"  Current  NTP offset : {offset:+.1f}s\n"
+                f"  This may indicate the system clock was manually altered."
             )
 
-    if abs(offset) > MAX_CLOCK_DRIFT_SECONDS:
+    if abs(offset) > MAX_CLOCK_DRIFT_SECS:
         raise RuntimeError(
-            f"SECURITY ALERT: System clock is out of sync with NTP by {offset:.1f}s "
-            f"(max allowed: {MAX_CLOCK_DRIFT_SECONDS}s). "
-            f"Possible clock manipulation. Refusing to operate."
+            f"[SECURITY ALERT] System clock is {offset:+.1f}s out of sync with NTP.\n"
+            f"  Maximum allowed drift : {MAX_CLOCK_DRIFT_SECS}s\n"
+            f"  This may indicate the system clock has been tampered with."
         )
 
     _last_ntp_offset = offset
-    logger.debug("NTP sync OK. Local clock offset: %.3fs", offset)
+    logger.debug("NTP sync OK. Clock offset: %+.3fs.", offset)
 
+
+# ── Public time API ───────────────────────────────────────────────
 
 def now_utc(skip_ntp: bool = False) -> datetime:
     """
-    Return current UTC time, cross-validated against NTP.
+    Current UTC time, cross-validated against NTP.
     Raises RuntimeError if clock manipulation is detected.
+    Pass skip_ntp=True only for non-security-critical display purposes.
     """
     if not skip_ntp:
         try:
             _update_ntp_offset()
         except RuntimeError:
             raise
-        except Exception as e:
-            logger.warning("NTP check error (non-fatal): %s", e)
+        except Exception as exc:
+            logger.warning("NTP check error (non-fatal): %s", exc)
 
-    # Apply cached offset if available for better accuracy
     local_ts = time.time()
     if _last_ntp_offset is not None:
         local_ts += _last_ntp_offset
-
     return datetime.fromtimestamp(local_ts, tz=timezone.utc)
-
-
-def monotonic_seconds() -> float:
-    """
-    Return monotonic clock seconds. Cannot be manipulated by system time changes.
-    Use for measuring elapsed time within a session.
-    """
-    return time.monotonic()
 
 
 def isoformat_z(dt: datetime) -> str:
@@ -198,124 +162,145 @@ def isoformat_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def friendly_local(dt: datetime) -> str:
+    """Return datetime formatted in Sri Lanka local time for display."""
+    sl = dt.astimezone(_get_local_tz())
+    return sl.strftime("%Y-%m-%d %H:%M:%S (UTC+05:30)")
+
+
 def parse_deadline_any(user_input: str) -> datetime:
     """
-    Accepts:
-      - ISO8601 with tz: 2026-02-04T09:00:00Z or +00:00
-      - Local human time (Sri Lanka): 2026-02-04 14:45[:00]
-      - Relative: 'in 10 minutes' / 'in 2 hours' / 'in 1 day'
-      - Optional prefix 'local ': 'local 2026-02-04 14:45:00'
+    Accept multiple formats and always return a UTC-aware datetime.
 
-    Returns timezone-aware datetime in UTC.
+    Formats accepted:
+      • 2026-03-01 14:45:00     → treated as Sri Lanka local time
+      • 2026-03-01T09:15:00Z   → explicit UTC
+      • 2026-03-01T09:15:00+05:30 → any tz offset
+      • in 10 minutes / in 2 hours / in 1 day
     """
     s = user_input.strip()
-
     if s.lower().startswith("local "):
         s = s[6:].strip()
 
     # Relative
     m = _REL_RE.match(s)
     if m:
-        qty = int(m.group(1))
+        qty  = int(m.group(1))
         unit = m.group(2).lower()
-        if "minute" in unit:
-            delta = timedelta(minutes=qty)
-        elif "hour" in unit:
-            delta = timedelta(hours=qty)
-        else:
-            delta = timedelta(days=qty)
+        delta = (timedelta(minutes=qty) if "minute" in unit
+                 else timedelta(hours=qty) if "hour" in unit
+                 else timedelta(days=qty))
         return (now_utc() + delta).astimezone(timezone.utc)
 
-    # ISO8601 with timezone
-    s_iso = s.replace(" ", "T")
-    s_iso = _ISO_Z_RE.sub("+00:00", s_iso)
+    # ISO 8601 with tz
+    s_iso = _ISO_Z_RE.sub("+00:00", s.replace(" ", "T"))
     try:
         dt = datetime.fromisoformat(s_iso)
         if dt.tzinfo is None:
-            raise ValueError("Timezone missing")
+            raise ValueError
         return dt.astimezone(timezone.utc)
     except Exception:
         pass
 
-    # Local human time (Sri Lanka)
+    # Local Sri Lanka time (no tz in string)
     local_tz = _get_local_tz()
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
-            dt_local = datetime.strptime(s, fmt).replace(tzinfo=local_tz)
-            return dt_local.astimezone(timezone.utc)
+            return datetime.strptime(s, fmt).replace(tzinfo=local_tz).astimezone(timezone.utc)
         except Exception:
             continue
 
     raise ValueError(
-        "Unrecognized deadline format. Use ISO8601 with Z, "
-        "'YYYY-MM-DD HH:MM:SS' (local Sri Lanka), or 'in N minutes/hours/days'."
+        "Unrecognised deadline format.\n"
+        "  Accepted formats:\n"
+        "    • 2026-03-01 14:45:00  (Sri Lanka local time)\n"
+        "    • 2026-03-01T09:15:00Z (UTC with Z)\n"
+        "    • in 30 minutes  /  in 2 hours  /  in 1 day"
     )
 
 
-def ensure_before_deadline(deadline_utc: datetime, last_ledger_ts: Optional[str] = None) -> None:
-    """
-    Raise if it is at or past the deadline.
-    Also checks that current time is not before the last ledger timestamp (rollback detection).
-    """
+def seconds_until(deadline_utc: datetime) -> float:
+    """Return seconds remaining until deadline (negative if past)."""
+    return (deadline_utc - now_utc(skip_ntp=True)).total_seconds()
+
+
+def human_remaining(deadline_utc: datetime) -> str:
+    """Human-readable time remaining string."""
+    secs = seconds_until(deadline_utc)
+    if secs <= 0:
+        return "deadline has passed"
+    h, rem = divmod(int(secs), 3600)
+    m, s   = divmod(rem, 60)
+    parts  = []
+    if h:
+        parts.append(f"{h} hour{'s' if h != 1 else ''}")
+    if m:
+        parts.append(f"{m} minute{'s' if m != 1 else ''}")
+    if s or not parts:
+        parts.append(f"{s} second{'s' if s != 1 else ''}")
+    return ", ".join(parts)
+
+
+def ensure_before_deadline(deadline_utc: datetime,
+                           last_ledger_ts: Optional[str] = None) -> None:
+    """Raise if deadline has passed or if clock rollback is detected."""
     current = now_utc()
 
-    # Rollback detection: time must never go backward relative to ledger
     if last_ledger_ts:
         try:
             last_ts = datetime.fromisoformat(last_ledger_ts.replace("Z", "+00:00"))
             if current < last_ts - timedelta(seconds=5):
                 raise RuntimeError(
-                    f"SECURITY ALERT: Current time ({isoformat_z(current)}) is before "
-                    f"last ledger entry ({last_ledger_ts}). "
-                    f"Possible clock rollback attack. Refusing to operate."
+                    f"[SECURITY ALERT] Clock rollback detected.\n"
+                    f"  Current time      : {isoformat_z(current)}\n"
+                    f"  Last ledger entry : {last_ledger_ts}\n"
+                    f"  The system clock appears to have been moved backward."
                 )
         except ValueError:
             pass
 
     if current >= deadline_utc:
-        raise RuntimeError(f"Auction closed: now ({isoformat_z(current)}) >= deadline ({isoformat_z(deadline_utc)})")
+        raise RuntimeError("deadline_passed")
 
 
-def ensure_after_deadline(deadline_utc: datetime, last_ledger_ts: Optional[str] = None) -> None:
-    """
-    Raise if deadline has not yet been reached.
-    Also checks rollback detection.
-    """
+def ensure_after_deadline(deadline_utc: datetime,
+                          last_ledger_ts: Optional[str] = None) -> None:
+    """Raise if deadline has not yet been reached or if clock rollback is detected."""
     current = now_utc()
 
-    # Rollback detection
     if last_ledger_ts:
         try:
             last_ts = datetime.fromisoformat(last_ledger_ts.replace("Z", "+00:00"))
             if current < last_ts - timedelta(seconds=5):
                 raise RuntimeError(
-                    f"SECURITY ALERT: Current time ({isoformat_z(current)}) is before "
-                    f"last ledger entry ({last_ledger_ts}). "
-                    f"Possible clock rollback attack. Refusing to operate."
+                    f"[SECURITY ALERT] Clock rollback detected.\n"
+                    f"  Current time      : {isoformat_z(current)}\n"
+                    f"  Last ledger entry : {last_ledger_ts}\n"
+                    f"  The system clock appears to have been moved backward."
                 )
         except ValueError:
             pass
 
     if current < deadline_utc:
-        raise RuntimeError(
-            f"Deadline not reached: now ({isoformat_z(current)}) < deadline ({isoformat_z(deadline_utc)})"
-        )
+        raise RuntimeError("deadline_not_reached")
 
 
 def verify_ntp_sync() -> dict:
-    """
-    Explicit NTP check. Returns status dict. Call at startup.
-    """
+    """Explicit NTP check for startup. Returns status dict."""
     try:
         _update_ntp_offset(force=True)
         offset = _last_ntp_offset
         return {
             "ok": True,
             "offset_seconds": round(offset, 3) if offset is not None else None,
-            "message": f"NTP sync OK. Offset={offset:.3f}s" if offset is not None else "NTP unavailable (using local clock)"
+            "message": (
+                f"Clock is accurate (NTP offset: {offset:+.3f}s)"
+                if offset is not None else
+                "NTP unavailable — using local clock"
+            ),
         }
-    except RuntimeError as e:
-        return {"ok": False, "offset_seconds": None, "message": str(e)}
+    except RuntimeError as exc:
+        return {"ok": False, "offset_seconds": None, "message": str(exc)}
 
 
 @dataclass(frozen=True)

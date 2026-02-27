@@ -9,18 +9,26 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Auction state machine
+# ── Auction state constants ───────────────────────────────────────
 AUCTION_STATE_OPEN     = "OPEN"
-AUCTION_STATE_CLOSED   = "CLOSED"    # Past deadline, not yet revealed
-AUCTION_STATE_REVEALED = "REVEALED"  # Bids decrypted and winner declared
+AUCTION_STATE_CLOSED   = "CLOSED"
+AUCTION_STATE_REVEALED = "REVEALED"
 
+MAX_FAILED_ATTEMPTS = 5
+
+
+# ── Low-level file helpers ────────────────────────────────────────
 
 def _canon_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _pretty_json(obj: Any) -> str:
+    """Human-readable JSON with 2-space indent — used for reveal records."""
+    return json.dumps(obj, indent=2, ensure_ascii=False)
+
+
 def atomic_write_text(path: Path, text: str) -> None:
-    """Write text to path atomically using a temp file + os.replace."""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
@@ -35,6 +43,13 @@ def write_json(path: Path, obj: Any) -> None:
     atomic_write_text(path, _canon_json(obj))
 
 
+def write_pretty_json(path: Path, obj: Any) -> None:
+    """Write human-readable JSON (for reveal records / receipts)."""
+    atomic_write_text(path, _pretty_json(obj))
+
+
+# ── Path registry ─────────────────────────────────────────────────
+
 @dataclass(frozen=True)
 class StorePaths:
     root: Path
@@ -47,38 +62,38 @@ class StorePaths:
     def users_dir(self) -> Path:
         return self.root / "users"
 
-    # ---------------- Auctions ----------------
-    def auction_dir(self, auction_id: str) -> Path:
-        return self.auctions_dir / auction_id
+    # Auction paths
+    def auction_dir(self, aid: str) -> Path:
+        return self.auctions_dir / aid
 
-    def auction_meta(self, auction_id: str) -> Path:
-        return self.auction_dir(auction_id) / "meta.json"
+    def auction_meta(self, aid: str) -> Path:
+        return self.auction_dir(aid) / "meta.json"
 
-    def auction_ledger(self, auction_id: str) -> Path:
-        return self.auction_dir(auction_id) / "ledger.log"
+    def auction_ledger(self, aid: str) -> Path:
+        return self.auction_dir(aid) / "ledger.log"
 
-    def bids_dir(self, auction_id: str) -> Path:
-        return self.auction_dir(auction_id) / "bids"
+    def bids_dir(self, aid: str) -> Path:
+        return self.auction_dir(aid) / "bids"
 
-    def bid_file(self, auction_id: str, bid_id: str) -> Path:
-        return self.bids_dir(auction_id) / f"{bid_id}.json"
+    def bid_file(self, aid: str, bid_id: str) -> Path:
+        return self.bids_dir(aid) / f"{bid_id}.json"
 
-    def auction_authorities_dir(self, auction_id: str) -> Path:
-        return self.auction_dir(auction_id) / "authorities"
+    def auction_authorities_dir(self, aid: str) -> Path:
+        return self.auction_dir(aid) / "authorities"
 
-    def auction_authority_dir(self, auction_id: str, authority_id: str) -> Path:
-        return self.auction_authorities_dir(auction_id) / authority_id
+    def auction_authority_dir(self, aid: str, auth_id: str) -> Path:
+        return self.auction_authorities_dir(aid) / auth_id
 
-    def auction_authority_pub(self, auction_id: str, authority_id: str) -> Path:
-        return self.auction_authority_dir(auction_id, authority_id) / "pub.pem"
+    def auction_authority_pub(self, aid: str, auth_id: str) -> Path:
+        return self.auction_authority_dir(aid, auth_id) / "pub.pem"
 
-    def auction_authority_priv_enc(self, auction_id: str, authority_id: str) -> Path:
-        return self.auction_authority_dir(auction_id, authority_id) / "priv.enc.json"
+    def auction_authority_priv_enc(self, aid: str, auth_id: str) -> Path:
+        return self.auction_authority_dir(aid, auth_id) / "priv.enc.json"
 
-    def failed_attempts_file(self, auction_id: str, authority_id: str) -> Path:
-        return self.auction_authority_dir(auction_id, authority_id) / "failed_attempts.json"
+    def failed_attempts_file(self, aid: str, auth_id: str) -> Path:
+        return self.auction_authority_dir(aid, auth_id) / "failed_attempts.json"
 
-    # ---------------- Bidder registry ----------------
+    # Bidder paths
     def bidders_dir(self) -> Path:
         return self.users_dir / "bidders"
 
@@ -98,88 +113,81 @@ class StorePaths:
         return self.bidder_dir(bidder_id) / "failed_attempts.json"
 
 
-# ---------------- Listing helpers ----------------
+# ── Listing helpers ───────────────────────────────────────────────
 
 def list_auction_ids(paths: StorePaths) -> List[str]:
     d = paths.auctions_dir
-    if not d.exists():
-        return []
-    return sorted([p.name for p in d.iterdir() if p.is_dir()])
+    return sorted(p.name for p in d.iterdir() if p.is_dir()) if d.exists() else []
 
 
-def list_bid_ids(paths: StorePaths, auction_id: str) -> List[str]:
-    d = paths.bids_dir(auction_id)
-    if not d.exists():
-        return []
-    return sorted([p.stem for p in d.glob("*.json")])
+def list_bid_ids(paths: StorePaths, aid: str) -> List[str]:
+    d = paths.bids_dir(aid)
+    return sorted(p.stem for p in d.glob("*.json")) if d.exists() else []
 
 
 def list_registered_bidders(paths: StorePaths) -> List[str]:
     d = paths.bidders_dir()
-    if not d.exists():
-        return []
-    return sorted([p.name for p in d.iterdir() if p.is_dir()])
+    return sorted(p.name for p in d.iterdir() if p.is_dir()) if d.exists() else []
 
 
-# ---------------- Auction meta ----------------
+# ── Auction meta ──────────────────────────────────────────────────
 
-def load_auction_meta(paths: StorePaths, auction_id: str) -> Dict[str, Any]:
-    p = paths.auction_meta(auction_id)
+def load_auction_meta(paths: StorePaths, aid: str) -> Dict[str, Any]:
+    p = paths.auction_meta(aid)
     if not p.exists():
-        raise FileNotFoundError(f"Auction not found: {auction_id}")
+        raise FileNotFoundError(
+            f"Auction '{aid}' not found.\n"
+            "  → Create an auction first using option 2 from the main menu."
+        )
     return read_json(p)
 
 
-def save_auction_meta(paths: StorePaths, auction_id: str, meta: Dict[str, Any]) -> None:
-    write_json(paths.auction_meta(auction_id), meta)
+def save_auction_meta(paths: StorePaths, aid: str, meta: Dict[str, Any]) -> None:
+    write_json(paths.auction_meta(aid), meta)
 
 
 def verify_meta_integrity(
     paths: StorePaths,
-    auction_id: str,
+    aid: str,
     committed_hash: Optional[str],
 ) -> None:
     """
-    Verify that meta.json has not been tampered with since auction creation.
-    Compares current hash against the hash committed in the ledger.
-    Raises RuntimeError if mismatch detected.
+    Compare the current meta.json hash against the hash committed in the ledger.
+    Raises RuntimeError with a clear message if they differ.
     """
     if committed_hash is None:
-        logger.warning("No committed meta hash found in ledger — skipping meta integrity check.")
+        logger.warning("No committed meta hash in ledger — skipping meta integrity check.")
         return
 
     from core.crypto import hash_meta
-    meta = load_auction_meta(paths, auction_id)
+    meta         = load_auction_meta(paths, aid)
     current_hash = hash_meta(meta)
 
     if current_hash != committed_hash:
         raise RuntimeError(
-            f"SECURITY ALERT: meta.json has been tampered with!\n"
-            f"  Committed hash (ledger): {committed_hash}\n"
-            f"  Current hash (file):     {current_hash}\n"
-            f"  Auction parameters (deadline, t, n, authority keys) may have been changed."
+            "[SECURITY ALERT] Auction configuration (meta.json) has been altered!\n\n"
+            f"  Hash recorded in ledger : {committed_hash}\n"
+            f"  Hash of current file    : {current_hash}\n\n"
+            "  The deadline, threshold (t/n), or authority public keys may have been\n"
+            "  changed since the auction was created. This auction cannot be trusted."
         )
 
-    logger.debug("Meta integrity OK for auction %s", auction_id)
+    logger.debug("Meta integrity OK for auction %s.", aid)
 
 
-# ---------------- Auction state ----------------
+# ── Auction state machine ─────────────────────────────────────────
 
-def get_auction_state(paths: StorePaths, auction_id: str) -> str:
-    """
-    Derive auction state from ledger events.
-    Returns one of: OPEN, CLOSED, REVEALED
-    """
+def get_auction_state(paths: StorePaths, aid: str) -> str:
+    """Derive state from ledger events + deadline, without trusting meta.json alone."""
     from core.ledger import Ledger
     from core.timeutil import now_utc, parse_deadline_any
 
-    led = Ledger(paths.auction_ledger(auction_id))
-
+    led = Ledger(paths.auction_ledger(aid))
     if led.is_revealed():
         return AUCTION_STATE_REVEALED
 
     try:
-        meta = load_auction_meta(paths, auction_id)
+        meta         = load_auction_meta(paths, aid)
         deadline_utc = parse_deadline_any(meta["deadline_utc"])
         if now_utc(skip_ntp=True) >= deadline_utc:
             return AUCTION_STATE_CLOSED
@@ -189,12 +197,9 @@ def get_auction_state(paths: StorePaths, auction_id: str) -> str:
     return AUCTION_STATE_OPEN
 
 
-# ---------------- Failed attempt tracking ----------------
+# ── Failed-attempt tracking ───────────────────────────────────────
 
-MAX_FAILED_ATTEMPTS = 5
-
-
-def _load_failed_attempts(path: Path) -> Dict[str, Any]:
+def _load_attempts(path: Path) -> Dict[str, Any]:
     if not path.exists():
         return {"count": 0, "locked": False}
     try:
@@ -203,85 +208,89 @@ def _load_failed_attempts(path: Path) -> Dict[str, Any]:
         return {"count": 0, "locked": False}
 
 
-def _save_failed_attempts(path: Path, data: Dict[str, Any]) -> None:
-    write_json(path, data)
-
-
-def check_not_locked(paths: StorePaths, auction_id: Optional[str], entity_id: str, is_authority: bool) -> None:
-    """Raise RuntimeError if entity is locked due to too many failed attempts."""
-    if is_authority and auction_id:
-        path = paths.failed_attempts_file(auction_id, entity_id)
-    else:
-        path = paths.bidder_failed_attempts(entity_id)
-
-    data = _load_failed_attempts(path)
+def check_not_locked(
+    paths: StorePaths,
+    aid: Optional[str],
+    entity_id: str,
+    is_authority: bool,
+) -> None:
+    path = (paths.failed_attempts_file(aid, entity_id)
+            if is_authority and aid else
+            paths.bidder_failed_attempts(entity_id))
+    data = _load_attempts(path)
     if data.get("locked"):
         raise RuntimeError(
-            f"Account '{entity_id}' is locked after {MAX_FAILED_ATTEMPTS} failed attempts. "
-            f"Contact the system administrator to unlock."
+            f"Account '{entity_id}' is LOCKED after too many failed password attempts.\n"
+            "  → Contact the system administrator to unlock this account."
         )
 
 
-def record_failed_attempt(paths: StorePaths, auction_id: Optional[str], entity_id: str, is_authority: bool) -> int:
-    """
-    Record a failed authentication attempt.
-    Returns remaining attempts before lockout.
-    Locks account if MAX_FAILED_ATTEMPTS reached.
-    """
-    if is_authority and auction_id:
-        path = paths.failed_attempts_file(auction_id, entity_id)
-    else:
-        path = paths.bidder_failed_attempts(entity_id)
-
-    data = _load_failed_attempts(path)
+def record_failed_attempt(
+    paths: StorePaths,
+    aid: Optional[str],
+    entity_id: str,
+    is_authority: bool,
+) -> int:
+    """Increment counter. Returns remaining attempts. Locks account when exhausted."""
+    path = (paths.failed_attempts_file(aid, entity_id)
+            if is_authority and aid else
+            paths.bidder_failed_attempts(entity_id))
+    data = _load_attempts(path)
     data["count"] = data.get("count", 0) + 1
-
-    remaining = MAX_FAILED_ATTEMPTS - data["count"]
+    remaining     = MAX_FAILED_ATTEMPTS - data["count"]
     if remaining <= 0:
         data["locked"] = True
-        logger.warning("SECURITY: Account '%s' locked after %d failed attempts", entity_id, MAX_FAILED_ATTEMPTS)
-
-    _save_failed_attempts(path, data)
+        logger.warning("SECURITY: Account '%s' locked after %d failed attempts.",
+                       entity_id, MAX_FAILED_ATTEMPTS)
+    write_json(path, data)
     return max(0, remaining)
 
 
-def reset_failed_attempts(paths: StorePaths, auction_id: Optional[str], entity_id: str, is_authority: bool) -> None:
-    """Reset failed attempt counter after successful authentication."""
-    if is_authority and auction_id:
-        path = paths.failed_attempts_file(auction_id, entity_id)
-    else:
-        path = paths.bidder_failed_attempts(entity_id)
-
+def reset_failed_attempts(
+    paths: StorePaths,
+    aid: Optional[str],
+    entity_id: str,
+    is_authority: bool,
+) -> None:
+    path = (paths.failed_attempts_file(aid, entity_id)
+            if is_authority and aid else
+            paths.bidder_failed_attempts(entity_id))
     if path.exists():
-        _save_failed_attempts(path, {"count": 0, "locked": False})
+        write_json(path, {"count": 0, "locked": False})
 
 
-# ---------------- Bids ----------------
+# ── Bid file helpers ──────────────────────────────────────────────
 
-def bid_exists(paths: StorePaths, auction_id: str, bid_id: str) -> bool:
-    return paths.bid_file(auction_id, bid_id).exists()
-
-
-def save_bid(paths: StorePaths, auction_id: str, bid_id: str, bid_obj: Dict[str, Any]) -> None:
-    if bid_exists(paths, auction_id, bid_id):
-        raise RuntimeError(f"Bid {bid_id} already exists — duplicate submission rejected.")
-    write_json(paths.bid_file(auction_id, bid_id), bid_obj)
+def bid_exists(paths: StorePaths, aid: str, bid_id: str) -> bool:
+    return paths.bid_file(aid, bid_id).exists()
 
 
-def load_bid(paths: StorePaths, auction_id: str, bid_id: str) -> Dict[str, Any]:
-    return read_json(paths.bid_file(auction_id, bid_id))
+def save_bid(paths: StorePaths, aid: str, bid_id: str, bid_obj: Dict[str, Any]) -> None:
+    if bid_exists(paths, aid, bid_id):
+        raise RuntimeError(
+            f"Bid '{bid_id}' already exists — duplicate submission rejected."
+        )
+    write_json(paths.bid_file(aid, bid_id), bid_obj)
 
 
-# ---------------- Bidder registry ----------------
+def load_bid(paths: StorePaths, aid: str, bid_id: str) -> Dict[str, Any]:
+    return read_json(paths.bid_file(aid, bid_id))
+
+
+# ── Bidder registry ───────────────────────────────────────────────
 
 def bidder_exists(paths: StorePaths, bidder_id: str) -> bool:
-    return paths.bidder_profile(bidder_id).exists() and paths.bidder_priv_enc(bidder_id).exists()
+    return (paths.bidder_profile(bidder_id).exists()
+            and paths.bidder_priv_enc(bidder_id).exists())
 
 
 def load_bidder_profile(paths: StorePaths, bidder_id: str) -> Dict[str, Any]:
     p = paths.bidder_profile(bidder_id)
     if not p.exists():
-        raise FileNotFoundError(f"Bidder not registered: {bidder_id}")
+        raise FileNotFoundError(
+            f"Bidder '{bidder_id}' is not registered.\n"
+            "  → Please register first using option 1 from the main menu."
+        )
     return read_json(p)
 
 
