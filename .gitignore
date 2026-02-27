@@ -1,1 +1,4 @@
 store/*
+!store/auctions/
+store/auctions/*
+!store/auctions/.gitkeep
