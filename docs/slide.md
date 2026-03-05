@@ -1,4 +1,4 @@
-# Sealed-Bid Auction System — Setup Phase
+# Sealed-Bid Auction System - Setup
 
 ## Bidder Registration
 
@@ -107,19 +107,7 @@ flowchart TD
 
 ---
 
-## Legend
-
-| Color | Meaning |
-|-------|---------|
-| Blue | User input / application logic |
-| Orange | Cryptographic operation |
-| Green | Data storage / output |
-| Yellow | Decision point |
-| Gray | Workflow start |
-
----
-
-# Sealed-Bid Auction System — Bidding & Reveal Phase
+# Sealed-Bid Auction System - Bidding & Reveal Phase
 
 ## Bid Submission
 
@@ -266,3 +254,90 @@ flowchart TD
 ```
 
 **Reveal output:** `reveal_{auction_id}.json` contains all bids ranked lowest-first, winner details, authority participants, ledger integrity status, and timestamps in both UTC and Sri Lanka local time.
+
+---
+
+## Verify Ledger
+
+```mermaid
+flowchart TD
+    L_START([Verify Ledger Integrity])
+    L_SELECT[Select auction from list]
+    L_LOAD[Load meta.json and<br/>ledger.log for auction]
+
+    subgraph META_CHECK [Meta Integrity Check]
+        L_META_HASH[Recompute SHA-256 hash<br/>of current meta.json<br/><i>canonical JSON: sorted keys,<br/>no whitespace</i>]
+        L_META_LEDGER[Read committed meta_hash<br/>from AUCTION_CREATED<br/>event in ledger]
+        L_META_CMP{Hashes<br/>match?}
+        L_META_FAIL[/SECURITY ALERT:<br/>meta.json has been altered<br/><i>deadline, threshold, or authority<br/>keys may have been changed</i>/]
+        L_META_OK[Meta integrity verified]
+    end
+
+    subgraph CHAIN_CHECK [Hash Chain Verification]
+        L_INIT[Initialize prev_hash<br/>= 64 zero bytes]
+        L_LOOP[For each entry in ledger:]
+        L_IDX{Index matches<br/>expected sequence?}
+        L_IDX_FAIL[/FAIL: index mismatch<br/><i>entry may have been<br/>inserted or removed</i>/]
+        L_PREV{Entry prev field<br/>matches previous<br/>entry hash?}
+        L_PREV_FAIL[/FAIL: hash chain broken<br/><i>ledger has been<br/>tampered with</i>/]
+        L_RECOMPUTE[Recompute SHA-256 of entry<br/><i>fields: i, ts, type, data, prev</i><br/><b>canonical JSON encoding</b>]
+        L_HASH_CMP{Recomputed hash<br/>matches stored h?}
+        L_HASH_FAIL[/FAIL: hash mismatch<br/><i>entry content has been<br/>modified after creation</i>/]
+        L_TS{Timestamp ≥<br/>previous entry?}
+        L_TS_FAIL[/FAIL: timestamp went backward<br/><i>possible clock-rollback attack</i>/]
+        L_NEXT[Advance to next entry<br/>prev_hash = current h]
+    end
+
+    L_DONE[Ledger intact:<br/>display entry count<br/>and tip hash]
+    L_EVENTS[Display all recorded events:<br/><i>index, timestamp UTC,<br/>event type</i><br/>AUCTION_CREATED<br/>BID_SUBMITTED x N<br/>AUCTION_REVEALED]
+
+    L_START --> L_SELECT
+    L_SELECT --> L_LOAD
+    L_LOAD --> META_CHECK
+    L_META_HASH --> L_META_LEDGER
+    L_META_LEDGER --> L_META_CMP
+    L_META_CMP -- No --> L_META_FAIL
+    L_META_CMP -- Yes --> L_META_OK
+    META_CHECK --> CHAIN_CHECK
+    L_INIT --> L_LOOP
+    L_LOOP --> L_IDX
+    L_IDX -- No --> L_IDX_FAIL
+    L_IDX -- Yes --> L_PREV
+    L_PREV -- No --> L_PREV_FAIL
+    L_PREV -- Yes --> L_RECOMPUTE
+    L_RECOMPUTE --> L_HASH_CMP
+    L_HASH_CMP -- No --> L_HASH_FAIL
+    L_HASH_CMP -- Yes --> L_TS
+    L_TS -- No --> L_TS_FAIL
+    L_TS -- Yes --> L_NEXT
+    L_NEXT --> L_LOOP
+    CHAIN_CHECK --> L_DONE
+    L_DONE --> L_EVENTS
+
+    style L_START fill:#e0e0e0,stroke:#666
+    style L_SELECT fill:#dbeafe,stroke:#3b82f6
+    style L_LOAD fill:#dbeafe,stroke:#3b82f6
+    style META_CHECK fill:#fef2f2,stroke:#dc2626,stroke-dasharray: 5 5
+    style L_META_HASH fill:#ffedd5,stroke:#ea580c
+    style L_META_LEDGER fill:#ffedd5,stroke:#ea580c
+    style L_META_CMP fill:#fef9c3,stroke:#ca8a04
+    style L_META_FAIL fill:#fee2e2,stroke:#dc2626
+    style L_META_OK fill:#dcfce7,stroke:#16a34a
+    style CHAIN_CHECK fill:#fef2f2,stroke:#dc2626,stroke-dasharray: 5 5
+    style L_INIT fill:#ffedd5,stroke:#ea580c
+    style L_LOOP fill:#dbeafe,stroke:#3b82f6
+    style L_IDX fill:#fef9c3,stroke:#ca8a04
+    style L_IDX_FAIL fill:#fee2e2,stroke:#dc2626
+    style L_PREV fill:#fef9c3,stroke:#ca8a04
+    style L_PREV_FAIL fill:#fee2e2,stroke:#dc2626
+    style L_RECOMPUTE fill:#ffedd5,stroke:#ea580c
+    style L_HASH_CMP fill:#fef9c3,stroke:#ca8a04
+    style L_HASH_FAIL fill:#fee2e2,stroke:#dc2626
+    style L_TS fill:#fef9c3,stroke:#ca8a04
+    style L_TS_FAIL fill:#fee2e2,stroke:#dc2626
+    style L_NEXT fill:#dbeafe,stroke:#3b82f6
+    style L_DONE fill:#dcfce7,stroke:#16a34a
+    style L_EVENTS fill:#dcfce7,stroke:#16a34a
+```
+
+**Ledger format:** Each line in `ledger.log` is a JSON object: `{"i": 0, "ts": "2026-03-05T10:00:00Z", "type": "AUCTION_CREATED", "data": {...}, "prev": "0000...0000", "h": "a1b2c3..."}`. The `prev` field of each entry must match the `h` field of the preceding entry, forming an unbroken SHA-256 hash chain. Any modification to any past entry invalidates all subsequent hashes.
