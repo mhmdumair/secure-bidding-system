@@ -111,11 +111,11 @@ flowchart TD
 
 | Color | Meaning |
 |-------|---------|
-| 🔵 Blue | User input / application logic |
-| 🟠 Orange | Cryptographic operation |
-| 🟢 Green | Data storage / output |
-| 🟡 Yellow | Decision point |
-| ⬜ Gray | Workflow start |
+| Blue | User input / application logic |
+| Orange | Cryptographic operation |
+| Green | Data storage / output |
+| Yellow | Decision point |
+| Gray | Workflow start |
 
 ---
 
@@ -134,7 +134,7 @@ flowchart TD
     B_DUP_REJECT[/Reject: one bid<br/>per bidder enforced/]
     B_AMOUNT[Enter bid amount<br/><i>validate against auction's<br/>min_bid / max_bid limits</i>]
     B_KEY[Generate random 32-byte<br/>bid encryption key k_bid<br/><b>os.urandom 32</b>]
-    B_ENC[Encrypt bid plaintext<br/>with k_bid using<br/><b>ChaCha20-Poly1305 AEAD</b><br/><i>AAD = auction_id | bid_id</i>]
+    B_ENC[Encrypt bid plaintext<br/>with k_bid using<br/><b>ChaCha20-Poly1305 AEAD</b><br/><i>AAD = auction_id + bid_id</i>]
     B_NONCE[Generate random 32-byte<br/>hidden nonce<br/><b>os.urandom 32</b>]
     B_COMMIT[Compute commitment hash<br/><b>SHA-256 of canonical bid<br/>concatenated with nonce</b><br/><i>binds bid without revealing it</i>]
     B_SHAMIR[Shamir Secret Sharing:<br/>split k_bid into n shares<br/><b>threshold t, field GF 2^521 − 1</b><br/><i>t−1 shares reveal nothing</i>]
@@ -211,7 +211,7 @@ flowchart TD
         V_SIG[Verify bidder's ECDSA<br/>signature on bid package<br/><i>reject if tampered</i>]
         V_UNSEAL[Unseal share from each<br/>participating authority<br/><b>ECDH + HKDF + ChaCha20</b>]
         V_RECON[Lagrange interpolation at x=0<br/>over GF 2^521 − 1<br/><b>reconstruct k_bid from t shares</b>]
-        V_DEC[Decrypt bid with k_bid<br/><b>ChaCha20-Poly1305</b><br/><i>AAD = auction_id | bid_id</i>]
+        V_DEC[Decrypt bid with k_bid<br/><b>ChaCha20-Poly1305</b><br/><i>AAD = auction_id + bid_id</i>]
         V_VERIFY[Verify commitment:<br/>SHA-256 of decrypted bid + nonce<br/><b>must match stored hash</b>]
         V_ZERO_K[Zero k_bid from memory]
     end
